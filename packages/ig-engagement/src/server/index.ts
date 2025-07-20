@@ -11,6 +11,7 @@ import { InstagramBot } from './services/InstagramBot';
 import { CompetitorMonitor } from './services/CompetitorMonitor';
 import { EngagementEngine } from './services/EngagementEngine';
 import { ProxyManager } from './services/ProxyManager';
+import { InstagramMessagingService } from './services/InstagramMessagingService';
 
 import authRoutes from './routes/auth';
 import accountRoutes from './routes/accounts';
@@ -18,6 +19,7 @@ import competitorRoutes from './routes/competitors';
 import campaignRoutes from './routes/campaigns';
 import analyticsRoutes from './routes/analytics';
 import settingsRoutes from './routes/settings';
+import instagramInboxRoutes, { setMessagingService } from './routes/instagram-inbox';
 
 import { authenticateToken } from './middleware/auth';
 
@@ -38,6 +40,7 @@ const proxyManager = new ProxyManager();
 const instagramBot = new InstagramBot(proxyManager, io);
 const competitorMonitor = new CompetitorMonitor(instagramBot, dbManager, io);
 const engagementEngine = new EngagementEngine(instagramBot, dbManager, io);
+const messagingService = new InstagramMessagingService(instagramBot, dbManager, io);
 
 // Middleware
 app.use(helmet());
@@ -59,6 +62,7 @@ app.use('/api/competitors', authenticateToken, competitorRoutes);
 app.use('/api/campaigns', authenticateToken, campaignRoutes);
 app.use('/api/analytics', authenticateToken, analyticsRoutes);
 app.use('/api/settings', authenticateToken, settingsRoutes);
+app.use('/api/instagram-inbox', authenticateToken, instagramInboxRoutes);
 
 // WebSocket handling
 io.on('connection', (socket) => {
@@ -139,6 +143,10 @@ async function startServer() {
     
     // Initialize Instagram accounts
     await instagramBot.initializeAllAccounts();
+    
+    // Initialize Instagram messaging service
+    setMessagingService(messagingService);
+    await messagingService.initialize();
     
     // Setup scheduled tasks
     setupCronJobs();

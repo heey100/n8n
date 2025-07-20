@@ -482,4 +482,261 @@ export class InstagramBot {
   isAccountActive(accountId: string): boolean {
     return this.activeSessions.has(accountId);
   }
+
+  /**
+   * Get direct message inbox for an account
+   */
+  async getDirectMessageInbox(accountId: string): Promise<any[] | null> {
+    try {
+      const client = this.clients.get(accountId);
+      if (!client) {
+        console.log(`❌ No Instagram client found for account ${accountId}`);
+        return null;
+      }
+
+      // Use Instagram Private API to get direct message inbox
+      const inbox = await client.directInbox();
+      
+      if (!inbox || !inbox.threads) {
+        console.log(`⚠️ No inbox threads found for account ${accountId}`);
+        return [];
+      }
+
+      // Transform Instagram API response to our format
+      const conversations = inbox.threads.map((thread: any) => ({
+        id: thread.thread_id,
+        accountId: accountId,
+        accountUsername: '', // Will be filled from account data
+        participantId: thread.users[0]?.pk || '',
+        participantUsername: thread.users[0]?.username || '',
+        participantProfilePic: thread.users[0]?.profile_pic_url || '',
+        participantFullName: thread.users[0]?.full_name || '',
+        lastMessage: thread.items && thread.items.length > 0 ? {
+          id: thread.items[0].item_id,
+          content: this.extractMessageContent(thread.items[0]),
+          timestamp: new Date(thread.items[0].timestamp / 1000),
+          senderUsername: thread.items[0].user_id === accountId ? 'me' : thread.users[0]?.username,
+          isFromMe: thread.items[0].user_id === accountId
+        } : null,
+        unreadCount: thread.read_state === 0 ? 1 : 0,
+        isVerified: thread.users[0]?.is_verified || false,
+        followerCount: thread.users[0]?.follower_count,
+        lastActiveAt: new Date(thread.last_activity_at / 1000),
+        conversationType: thread.thread_type === 'private' ? 'direct' : 'group',
+        isBusinessAccount: thread.users[0]?.is_business || false
+      }));
+
+      console.log(`📥 Retrieved ${conversations.length} conversations for account ${accountId}`);
+      return conversations;
+
+    } catch (error) {
+      console.error(`❌ Error getting Instagram inbox for account ${accountId}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Get messages for a specific conversation
+   */
+  async getConversationMessages(
+    accountId: string, 
+    conversationId: string, 
+    since?: Date
+  ): Promise<any[] | null> {
+    try {
+      const client = this.clients.get(accountId);
+      if (!client) {
+        console.log(`❌ No Instagram client found for account ${accountId}`);
+        return null;
+      }
+
+      // Get conversation thread details
+      const thread = await client.directThread(conversationId);
+      
+      if (!thread || !thread.items) {
+        console.log(`⚠️ No messages found for conversation ${conversationId}`);
+        return [];
+      }
+
+      // Filter messages since the last sync time
+      let messages = thread.items;
+      if (since) {
+        messages = messages.filter((item: any) => {
+          const messageTime = new Date(item.timestamp / 1000);
+          return messageTime > since;
+        });
+      }
+
+      // Transform to our message format
+      const formattedMessages = messages.map((item: any) => ({
+        id: item.item_id,
+        accountId: accountId,
+        accountUsername: '', // Will be filled
+        conversationId: conversationId,
+        senderId: item.user_id,
+        senderUsername: this.getUsernameFromThread(thread, item.user_id),
+        senderProfilePic: this.getProfilePicFromThread(thread, item.user_id),
+        content: this.extractMessageContent(item),
+        timestamp: new Date(item.timestamp / 1000),
+        isRead: true, // Instagram API doesn't provide this easily
+        messageType: this.getMessageType(item),
+        attachments: this.extractAttachments(item),
+        isFromMe: item.user_id === accountId
+      }));
+
+      console.log(`📨 Retrieved ${formattedMessages.length} new messages for conversation ${conversationId}`);
+      return formattedMessages;
+
+    } catch (error) {
+      console.error(`❌ Error getting conversation messages:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Send a direct message
+   */
+  async sendDirectMessage(
+    accountId: string,
+    conversationId: string,
+    content: string,
+    attachment?: { type: string; data: Buffer | string }
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      const client = this.clients.get(accountId);
+      if (!client) {
+        return { success: false, error: `No Instagram client found for account ${accountId}` };
+      }
+
+      let result;
+
+      if (attachment) {
+        // Send message with attachment
+        switch (attachment.type) {
+          case 'image':
+            result = await client.directSendPhoto(conversationId, attachment.data, content);
+            break;
+          case 'video':
+            result = await client.directSendVideo(conversationId, attachment.data, content);
+            break;
+          default:
+            // Fallback to text message
+            result = await client.directSendText(conversationId, content);
+        }
+      } else {
+        // Send text message
+        result = await client.directSendText(conversationId, content);
+      }
+
+      if (result && result.status === 'ok') {
+        console.log(`✅ Instagram message sent successfully to conversation ${conversationId}`);
+        return { 
+          success: true, 
+          messageId: result.item_id || `msg_${Date.now()}` 
+        };
+      } else {
+        console.error(`❌ Failed to send Instagram message:`, result);
+        return { 
+          success: false, 
+          error: result?.message || 'Failed to send message' 
+        };
+      }
+
+    } catch (error) {
+      console.error(`❌ Error sending Instagram direct message:`, error);
+      return { 
+        success: false, 
+        error: error.message 
+      };
+    }
+  }
+
+  /**
+   * Extract message content from Instagram API item
+   */
+  private extractMessageContent(item: any): string {
+    if (item.item_type === 'text') {
+      return item.text || '';
+    } else if (item.item_type === 'media_share') {
+      return item.media_share?.caption?.text || 'Shared a post';
+    } else if (item.item_type === 'story_share') {
+      return 'Shared a story';
+    } else if (item.item_type === 'media') {
+      return item.media?.caption?.text || 'Sent media';
+    } else if (item.item_type === 'voice_media') {
+      return 'Sent voice message';
+    } else if (item.item_type === 'video_call_event') {
+      return 'Video call';
+    } else if (item.item_type === 'link') {
+      return item.link?.text || 'Sent a link';
+    } else {
+      return `[${item.item_type || 'unknown'}]`;
+    }
+  }
+
+  /**
+   * Get message type from Instagram API item
+   */
+  private getMessageType(item: any): string {
+    switch (item.item_type) {
+      case 'text':
+        return 'text';
+      case 'media':
+        return item.media?.media_type === 1 ? 'image' : 'video';
+      case 'voice_media':
+        return 'voice';
+      case 'story_share':
+        return 'story_reply';
+      case 'media_share':
+        return 'post_mention';
+      default:
+        return 'text';
+    }
+  }
+
+  /**
+   * Extract attachments from Instagram API item
+   */
+  private extractAttachments(item: any): Array<{ type: string; url: string; thumbnail?: string }> | undefined {
+    const attachments = [];
+
+    if (item.item_type === 'media' && item.media) {
+      if (item.media.image_versions2) {
+        attachments.push({
+          type: 'image',
+          url: item.media.image_versions2.candidates[0]?.url || '',
+          thumbnail: item.media.image_versions2.candidates[item.media.image_versions2.candidates.length - 1]?.url
+        });
+      } else if (item.media.video_versions) {
+        attachments.push({
+          type: 'video',
+          url: item.media.video_versions[0]?.url || '',
+          thumbnail: item.media.image_versions2?.candidates[0]?.url
+        });
+      }
+    } else if (item.item_type === 'voice_media' && item.voice_media) {
+      attachments.push({
+        type: 'voice',
+        url: item.voice_media.media?.audio?.audio_src || ''
+      });
+    }
+
+    return attachments.length > 0 ? attachments : undefined;
+  }
+
+  /**
+   * Get username from thread participants
+   */
+  private getUsernameFromThread(thread: any, userId: string): string {
+    const user = thread.users?.find((u: any) => u.pk === userId);
+    return user?.username || 'unknown';
+  }
+
+  /**
+   * Get profile picture from thread participants
+   */
+  private getProfilePicFromThread(thread: any, userId: string): string {
+    const user = thread.users?.find((u: any) => u.pk === userId);
+    return user?.profile_pic_url || '';
+  }
 }
