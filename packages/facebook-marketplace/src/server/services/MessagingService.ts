@@ -90,13 +90,34 @@ export class MessagingService {
     try {
       console.log(`📬 Fetching messages for account: ${accountEmail}`);
 
-      // Navigate to Facebook Marketplace messages
-      await page.goto('https://www.facebook.com/marketplace/inbox', {
+             // Navigate to Facebook Marketplace
+      await page.goto('https://www.facebook.com/marketplace', {
         waitUntil: 'networkidle2',
         timeout: 30000
       });
 
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(2000);
+
+      // Click on "Inbox" in the marketplace menu
+      const inboxButton = await page.$('[data-testid="marketplace-inbox-button"], [aria-label*="Inbox"], a[href*="marketplace/inbox"]');
+      if (inboxButton) {
+        await inboxButton.click();
+        await page.waitForTimeout(3000);
+      } else {
+        // Fallback: try direct navigation
+        await page.goto('https://www.facebook.com/marketplace/inbox', {
+          waitUntil: 'networkidle2',
+          timeout: 30000
+        });
+        await page.waitForTimeout(3000);
+      }
+
+      // Look for "Mark Messages" or similar section
+      const markMessagesSection = await page.$('[data-testid="marketplace-messages"], [aria-label*="Messages"], div:has-text("Messages")');
+      if (markMessagesSection) {
+        await markMessagesSection.click();
+        await page.waitForTimeout(2000);
+      }
 
       // Get all conversation threads
       const conversations = await page.evaluate(() => {
@@ -210,27 +231,100 @@ export class MessagingService {
         throw new Error(`No active session for account ${request.accountId}`);
       }
 
-      // Navigate to the specific conversation
-      await page.goto('https://www.facebook.com/marketplace/inbox', {
+             // Navigate through Facebook's proper flow: Marketplace → Inbox → Mark Messages → Messages
+      
+       // Step 1: Go to Facebook Marketplace
+      await page.goto('https://www.facebook.com/marketplace', {
         waitUntil: 'networkidle2',
         timeout: 30000
       });
+      await page.waitForTimeout(2000);
 
-      await page.waitForTimeout(3000);
-
-      // Find and click the conversation
-      // Since we can't use conversationId directly, we'll need to match by sender name or message content
-      // This is a limitation - in a real implementation, you'd store Facebook's internal conversation IDs
-
-      // For now, let's click the first unread conversation (demonstration)
-      const conversationClicked = await page.evaluate(() => {
-        const unreadConversations = document.querySelectorAll('[data-testid="marketplace-inbox-conversation"]');
-        if (unreadConversations.length > 0) {
-          (unreadConversations[0] as HTMLElement).click();
-          return true;
+      // Step 2: Click "Inbox" button
+      const inboxClicked = await page.evaluate(() => {
+        // Try multiple selectors for the Inbox button
+        const selectors = [
+          '[data-testid="marketplace-inbox-button"]',
+          '[aria-label*="Inbox"]',
+          'a[href*="marketplace/inbox"]',
+          'div[role="button"]:has-text("Inbox")',
+          'span:has-text("Inbox")'
+        ];
+        
+        for (const selector of selectors) {
+          const button = document.querySelector(selector) as HTMLElement;
+          if (button) {
+            button.click();
+            return true;
+          }
         }
         return false;
       });
+
+      if (!inboxClicked) {
+        // Fallback: direct navigation
+        await page.goto('https://www.facebook.com/marketplace/inbox', {
+          waitUntil: 'networkidle2',
+          timeout: 30000
+        });
+      }
+      await page.waitForTimeout(3000);
+
+      // Step 3: Look for and click "Mark Messages" or "Messages" section
+      const messagesClicked = await page.evaluate(() => {
+        const messageSelectors = [
+          '[data-testid="marketplace-messages"]',
+          '[data-testid="mark-messages"]',
+          '[aria-label*="Messages"]',
+          'div[role="button"]:has-text("Messages")',
+          'span:has-text("Messages")',
+          'div:has-text("Mark Messages")',
+          // Sometimes it's a tab or navigation item
+          '[role="tab"]:has-text("Messages")',
+          'a:has-text("Messages")'
+        ];
+        
+        for (const selector of messageSelectors) {
+          const button = document.querySelector(selector) as HTMLElement;
+          if (button) {
+            button.click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (messagesClicked) {
+        await page.waitForTimeout(2000);
+      }
+
+      // Step 4: Now look for the actual messages/conversations
+      await page.waitForTimeout(1000);
+
+      // Find and click the conversation we want to reply to
+      // For demo, we'll click the first available conversation
+      const conversationClicked = await page.evaluate((convId) => {
+        // Try to find conversations with various selectors
+        const conversationSelectors = [
+          '[data-testid="marketplace-inbox-conversation"]',
+          '[data-testid="conversation-item"]',
+          '[role="button"][aria-label*="conversation"]',
+          'div[data-testid*="conversation"]',
+          // Broader selectors
+          'div[role="button"]:has([data-testid*="message"])',
+          'li[role="button"]:has([data-testid*="conversation"])'
+        ];
+        
+        for (const selector of conversationSelectors) {
+          const conversations = document.querySelectorAll(selector);
+          if (conversations.length > 0) {
+            // Click the first conversation (or match by convId if available)
+            (conversations[0] as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      }, request.conversationId);
 
       if (!conversationClicked) {
         throw new Error('Could not find conversation to reply to');
