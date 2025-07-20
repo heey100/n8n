@@ -4,6 +4,8 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import AdblockerPlugin from 'puppeteer-extra-plugin-adblocker';
 import { Server } from 'socket.io';
 import { DatabaseManager, FacebookAccount, CarListing } from './DatabaseManager';
+import { ImageProcessor } from './ImageProcessor';
+import { DescriptionGenerator } from './DescriptionGenerator';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -33,12 +35,16 @@ export class FacebookBot {
   private sessions: Map<string, FacebookSession> = new Map();
   private dbManager: DatabaseManager;
   private io: Server;
+  private imageProcessor: ImageProcessor;
+  private descriptionGenerator: DescriptionGenerator;
   private isRunning: boolean = false;
   private readonly userDataDir: string;
 
   constructor(dbManager: DatabaseManager, io: Server) {
     this.dbManager = dbManager;
     this.io = io;
+    this.imageProcessor = new ImageProcessor();
+    this.descriptionGenerator = new DescriptionGenerator();
     this.userDataDir = path.join(process.cwd(), 'facebook_profiles');
     this.ensureUserDataDir();
   }
@@ -236,6 +242,18 @@ export class FacebookBot {
 
       const { page } = session;
 
+      // Process images to avoid duplicate detection
+      let processedImages: string[] = [];
+      if (carListing.images.length > 0) {
+        console.log(`🖼️  Processing ${carListing.images.length} images to avoid duplicate detection...`);
+        processedImages = await this.imageProcessor.processCarImages(carListing.images, carId);
+        console.log(`✅ Processed ${processedImages.length} unique images`);
+      }
+
+      // Generate unique description for this account
+      const uniqueDescription = this.descriptionGenerator.generateDescriptionForAccount(carListing, accountId);
+      console.log(`📝 Generated unique description for account ${session.email} (${uniqueDescription.length} characters)`);
+
       // Navigate to Facebook Marketplace
       await page.goto('https://www.facebook.com/marketplace/create/vehicle', { 
         waitUntil: 'networkidle2',
@@ -248,9 +266,9 @@ export class FacebookBot {
       // Fill out the vehicle form
       await this.fillVehicleForm(page, carListing);
 
-      // Upload images
-      if (carListing.images.length > 0) {
-        await this.uploadImages(page, carListing.images);
+      // Upload processed images (unique versions)
+      if (processedImages.length > 0) {
+        await this.uploadImages(page, processedImages);
       }
 
       // Set price
@@ -259,8 +277,8 @@ export class FacebookBot {
       // Set location
       await this.setLocation(page, carListing.location);
 
-      // Add description
-      await this.setDescription(page, carListing.description);
+      // Add unique description
+      await this.setDescription(page, uniqueDescription);
 
       // Submit the listing
       const postResult = await this.submitListing(page);
