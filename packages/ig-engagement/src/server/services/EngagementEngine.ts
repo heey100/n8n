@@ -12,13 +12,16 @@ interface EngagementSettings {
   maxLikesPerHour: number;
   maxCommentsPerHour: number;
   
-  // Daily engagement limits
-  maxEngagementsPerDay: number; // Total daily engagement limit
-  maxFollowsPerDay: number;
-  maxLikesPerDay: number;
-  maxCommentsPerDay: number;
-  maxStoryViewsPerDay: number;
-  maxStoryCommentsPerDay: number;
+  // UNLIMITED total daily engagements - no daily caps!
+  unlimitedEngagements: boolean; // Set to true for unlimited daily interactions
+  maxEngagementsPerDay?: number; // Optional - only used if unlimitedEngagements is false
+  
+  // Hourly rate limits (for safety, not daily caps)
+  maxFollowsPerDay?: number; // Optional safety limit
+  maxLikesPerDay?: number; // Optional safety limit  
+  maxCommentsPerDay?: number; // Optional safety limit
+  maxStoryViewsPerDay?: number; // Optional safety limit
+  maxStoryCommentsPerDay?: number; // Optional safety limit
   
   targetStories: boolean;
   addToCloseFriends: boolean;
@@ -30,9 +33,28 @@ interface EngagementSettings {
   minFollowers: number;
   maxFollowers: number;
   
-  // Engagement frequency per profile
-  engagementsPerProfile: number; // How many times to engage with each profile
-  profileEngagementSpread: number; // Hours to spread engagements across
+  // FLEXIBLE per-lead engagement settings
+  interactionsPerLead: {
+    min: number; // Minimum interactions per lead (e.g., 3)
+    max: number; // Maximum interactions per lead (e.g., 7, 9, unlimited)
+    distribution: 'random' | 'progressive' | 'fixed'; // How to distribute interactions
+  };
+  
+  // Engagement spread timing
+  interactionSpread: {
+    timeframe: number; // Hours to spread interactions across (e.g., 24, 48, 72)
+    pattern: 'even' | 'random' | 'burst'; // Distribution pattern
+  };
+  
+  // Advanced interaction controls
+  interactionTypes: {
+    follow: { enabled: boolean; weight: number }; // Weight determines frequency
+    like: { enabled: boolean; weight: number; postsToLike: { min: number; max: number } };
+    comment: { enabled: boolean; weight: number; commentsToMake: { min: number; max: number } };
+    storyView: { enabled: boolean; weight: number; storiesToView: { min: number; max: number } };
+    storyComment: { enabled: boolean; weight: number };
+    closeFriend: { enabled: boolean; weight: number };
+  };
 }
 
 interface CampaignStats {
@@ -50,7 +72,7 @@ interface CampaignStats {
 
 interface DailyEngagementStats {
   date: string;
-  totalEngagements: number;
+  totalEngagements: number; // UNLIMITED - no cap!
   follows: number;
   unfollows: number;
   likes: number;
@@ -59,8 +81,26 @@ interface DailyEngagementStats {
   storyComments: number;
   closeFriendsAdded: number;
   profilesEngaged: number;
+  uniqueLeadsEngaged: number; // Track unique leads
+  averageInteractionsPerLead: number; // Track avg interactions per lead
   errors: number;
-  targetReached: boolean;
+  isUnlimited: boolean; // Track if running in unlimited mode
+}
+
+interface LeadEngagementPlan {
+  leadUsername: string;
+  totalInteractions: number; // 3-7, 3-9, etc.
+  interactionSchedule: Array<{
+    type: 'follow' | 'like' | 'comment' | 'story_view' | 'story_comment' | 'close_friend';
+    scheduledFor: Date;
+    completed: boolean;
+    postId?: string; // For likes/comments
+    storyId?: string; // For story interactions
+  }>;
+  startedAt: Date;
+  expectedCompletionAt: Date;
+  actualCompletionAt?: Date;
+  status: 'planned' | 'in_progress' | 'completed' | 'paused';
 }
 
 export class EngagementEngine {
@@ -71,7 +111,8 @@ export class EngagementEngine {
   private actionQueues: Map<string, any[]> = new Map();
   private rateLimits: Map<string, { follows: number; likes: number; comments: number; lastReset: Date }> = new Map();
   private dailyStats: Map<string, DailyEngagementStats> = new Map(); // accountId -> daily stats
-  private profileEngagementTracking: Map<string, Map<string, number>> = new Map(); // accountId -> Map<username, engagementCount>
+  private leadEngagementPlans: Map<string, Map<string, LeadEngagementPlan>> = new Map(); // accountId -> Map<username, plan>
+  private leadEngagementHistory: Map<string, Map<string, number>> = new Map(); // accountId -> Map<username, totalInteractionsCompleted>
 
   constructor(instagramBot: InstagramBot, dbManager: DatabaseManager, io: Server) {
     this.instagramBot = instagramBot;
@@ -93,8 +134,9 @@ export class EngagementEngine {
   private initializeDailyStats(): void {
     // Initialize daily stats for all accounts
     this.dailyStats.clear();
-    this.profileEngagementTracking.clear();
-    console.log('📊 Daily stats initialized');
+    this.leadEngagementPlans.clear();
+    // Don't clear leadEngagementHistory - we want to track cumulative interactions
+    console.log('📊 Daily stats initialized (unlimited engagement mode)');
   }
 
   private resetDailyStats(): void {
@@ -128,28 +170,192 @@ export class EngagementEngine {
         storyComments: 0,
         closeFriendsAdded: 0,
         profilesEngaged: 0,
+        uniqueLeadsEngaged: 0,
+        averageInteractionsPerLead: 0,
         errors: 0,
-        targetReached: false
+        isUnlimited: true
       });
     }
     return this.dailyStats.get(accountId)!;
   }
 
-  private getProfileEngagementCount(accountId: string, username: string): number {
-    if (!this.profileEngagementTracking.has(accountId)) {
-      this.profileEngagementTracking.set(accountId, new Map());
+  /**
+   * Create a customized engagement plan for a new lead
+   */
+  private createLeadEngagementPlan(
+    accountId: string, 
+    username: string, 
+    settings: EngagementSettings
+  ): LeadEngagementPlan {
+    // Determine number of interactions for this lead
+    const { min, max, distribution } = settings.interactionsPerLead;
+    
+    let totalInteractions: number;
+    switch (distribution) {
+      case 'random':
+        totalInteractions = Math.floor(Math.random() * (max - min + 1)) + min;
+        break;
+      case 'progressive':
+        // Progressive: start with min, increase over time
+        const leadHistory = this.getLeadEngagementHistory(accountId, username);
+        totalInteractions = Math.min(max, min + Math.floor(leadHistory / 5));
+        break;
+      case 'fixed':
+        totalInteractions = max; // Always use max
+        break;
+      default:
+        totalInteractions = Math.floor((min + max) / 2); // Average
     }
-    const accountTracking = this.profileEngagementTracking.get(accountId)!;
-    return accountTracking.get(username) || 0;
+
+    // Create interaction schedule spread over timeframe
+    const schedule = this.generateInteractionSchedule(totalInteractions, settings);
+    
+    const plan: LeadEngagementPlan = {
+      leadUsername: username,
+      totalInteractions,
+      interactionSchedule: schedule,
+      startedAt: new Date(),
+      expectedCompletionAt: new Date(Date.now() + settings.interactionSpread.timeframe * 60 * 60 * 1000),
+      status: 'planned'
+    };
+
+    // Store the plan
+    if (!this.leadEngagementPlans.has(accountId)) {
+      this.leadEngagementPlans.set(accountId, new Map());
+    }
+    this.leadEngagementPlans.get(accountId)!.set(username, plan);
+
+    console.log(`📋 Created engagement plan for ${username}: ${totalInteractions} interactions over ${settings.interactionSpread.timeframe}h`);
+    return plan;
   }
 
-  private incrementProfileEngagement(accountId: string, username: string): void {
-    if (!this.profileEngagementTracking.has(accountId)) {
-      this.profileEngagementTracking.set(accountId, new Map());
+  /**
+   * Generate a smart interaction schedule based on settings
+   */
+  private generateInteractionSchedule(
+    totalInteractions: number, 
+    settings: EngagementSettings
+  ): LeadEngagementPlan['interactionSchedule'] {
+    const schedule: LeadEngagementPlan['interactionSchedule'] = [];
+    const { timeframe, pattern } = settings.interactionSpread;
+    const { interactionTypes } = settings;
+
+    // Calculate weights for each interaction type
+    const enabledTypes = Object.entries(interactionTypes)
+      .filter(([_, config]) => config.enabled)
+      .map(([type, config]) => ({ type, weight: config.weight }));
+
+    const totalWeight = enabledTypes.reduce((sum, item) => sum + item.weight, 0);
+
+    // Generate interactions based on weights
+    for (let i = 0; i < totalInteractions; i++) {
+      // Select interaction type based on weights
+      const random = Math.random() * totalWeight;
+      let currentWeight = 0;
+      let selectedType = 'like'; // fallback
+
+      for (const { type, weight } of enabledTypes) {
+        currentWeight += weight;
+        if (random <= currentWeight) {
+          selectedType = type;
+          break;
+        }
+      }
+
+      // Calculate when to schedule this interaction
+      let scheduledFor: Date;
+      const baseTime = Date.now();
+      
+      switch (pattern) {
+        case 'even':
+          // Spread evenly across timeframe
+          const intervalMs = (timeframe * 60 * 60 * 1000) / totalInteractions;
+          scheduledFor = new Date(baseTime + (i * intervalMs));
+          break;
+        case 'random':
+          // Random within timeframe
+          const randomMs = Math.random() * timeframe * 60 * 60 * 1000;
+          scheduledFor = new Date(baseTime + randomMs);
+          break;
+        case 'burst':
+          // Concentrated bursts with gaps
+          const burstSize = Math.min(3, totalInteractions - i);
+          const burstInterval = 30 * 60 * 1000; // 30 min between bursts
+          const burstPosition = Math.floor(i / burstSize);
+          scheduledFor = new Date(baseTime + (burstPosition * burstInterval) + (i % burstSize) * 5 * 60 * 1000);
+          break;
+        default:
+          scheduledFor = new Date(baseTime + Math.random() * timeframe * 60 * 60 * 1000);
+      }
+
+      schedule.push({
+        type: selectedType as any,
+        scheduledFor,
+        completed: false
+      });
     }
-    const accountTracking = this.profileEngagementTracking.get(accountId)!;
-    const currentCount = accountTracking.get(username) || 0;
-    accountTracking.set(username, currentCount + 1);
+
+    // Sort by scheduled time
+    schedule.sort((a, b) => a.scheduledFor.getTime() - b.scheduledFor.getTime());
+    
+    return schedule;
+  }
+
+  /**
+   * Get lead engagement history (total completed interactions)
+   */
+  private getLeadEngagementHistory(accountId: string, username: string): number {
+    if (!this.leadEngagementHistory.has(accountId)) {
+      this.leadEngagementHistory.set(accountId, new Map());
+    }
+    return this.leadEngagementHistory.get(accountId)!.get(username) || 0;
+  }
+
+  /**
+   * Update lead engagement history
+   */
+  private updateLeadEngagementHistory(accountId: string, username: string): void {
+    if (!this.leadEngagementHistory.has(accountId)) {
+      this.leadEngagementHistory.set(accountId, new Map());
+    }
+    const history = this.leadEngagementHistory.get(accountId)!;
+    const current = history.get(username) || 0;
+    history.set(username, current + 1);
+  }
+
+  /**
+   * Check if we should continue engaging with a lead based on their plan
+   */
+  private shouldEngageWithLead(accountId: string, username: string, settings: EngagementSettings): boolean {
+    // Get or create engagement plan for this lead
+    let plan = this.getLeadEngagementPlan(accountId, username);
+    
+    if (!plan) {
+      // Create new plan for this lead
+      plan = this.createLeadEngagementPlan(accountId, username, settings);
+    }
+
+    // Check if plan is completed
+    if (plan.status === 'completed') {
+      return false;
+    }
+
+    // Check if there are pending interactions
+    const pendingInteractions = plan.interactionSchedule.filter(i => 
+      !i.completed && i.scheduledFor.getTime() <= Date.now()
+    );
+
+    return pendingInteractions.length > 0;
+  }
+
+  /**
+   * Get lead engagement plan
+   */
+  private getLeadEngagementPlan(accountId: string, username: string): LeadEngagementPlan | null {
+    if (!this.leadEngagementPlans.has(accountId)) {
+      return null;
+    }
+    return this.leadEngagementPlans.get(accountId)!.get(username) || null;
   }
 
   private updateDailyStats(accountId: string, action: string, success: boolean = true): void {
@@ -205,27 +411,44 @@ export class EngagementEngine {
     const limits = this.getRateLimit(accountId);
     const dailyStats = this.getDailyStats(accountId);
     
-    // Check if daily limit reached
-    if (dailyStats.totalEngagements >= settings.maxEngagementsPerDay) {
-      dailyStats.targetReached = true;
+    // UNLIMITED MODE: Only check hourly rate limits for safety, no daily caps!
+    if (settings.unlimitedEngagements) {
+      switch (action) {
+        case 'follow':
+          return limits.follows < settings.maxFollowsPerHour;
+        case 'like':
+          return limits.likes < settings.maxLikesPerHour;
+        case 'comment':
+          return limits.comments < settings.maxCommentsPerHour;
+        case 'story_view':
+          return true; // No hourly limit for story views in unlimited mode
+        case 'story_comment':
+          return true; // No hourly limit for story comments in unlimited mode
+        default:
+          return true;
+      }
+    }
+    
+    // LEGACY MODE: Check daily limits if not unlimited
+    if (settings.maxEngagementsPerDay && dailyStats.totalEngagements >= settings.maxEngagementsPerDay) {
       return false;
     }
     
-    // Check specific daily limits
+    // Check specific daily limits (only if set)
     switch (action) {
       case 'follow':
         return limits.follows < settings.maxFollowsPerHour && 
-               dailyStats.follows < settings.maxFollowsPerDay;
+               (!settings.maxFollowsPerDay || dailyStats.follows < settings.maxFollowsPerDay);
       case 'like':
         return limits.likes < settings.maxLikesPerHour && 
-               dailyStats.likes < settings.maxLikesPerDay;
+               (!settings.maxLikesPerDay || dailyStats.likes < settings.maxLikesPerDay);
       case 'comment':
         return limits.comments < settings.maxCommentsPerHour && 
-               dailyStats.comments < settings.maxCommentsPerDay;
+               (!settings.maxCommentsPerDay || dailyStats.comments < settings.maxCommentsPerDay);
       case 'story_view':
-        return dailyStats.storyViews < settings.maxStoryViewsPerDay;
+        return !settings.maxStoryViewsPerDay || dailyStats.storyViews < settings.maxStoryViewsPerDay;
       case 'story_comment':
-        return dailyStats.storyComments < settings.maxStoryCommentsPerDay;
+        return !settings.maxStoryCommentsPerDay || dailyStats.storyComments < settings.maxStoryCommentsPerDay;
       default:
         return false;
     }
@@ -391,9 +614,8 @@ export class EngagementEngine {
       return false;
     }
 
-    // Check if we've already engaged with this profile enough times
-    const currentEngagements = this.getProfileEngagementCount(accountId, target.username);
-    if (currentEngagements >= settings.engagementsPerProfile) {
+    // Check if we should continue engaging with this lead based on their custom plan
+    if (!this.shouldEngageWithLead(accountId, target.username, settings)) {
       return false;
     }
 
@@ -406,7 +628,7 @@ export class EngagementEngine {
       if (settings.maxLikesPerHour > 0 && this.canPerformAction(accountId, 'like', settings)) {
         await this.likeRecentPosts(target, accountId, settings);
         this.incrementActionCount(accountId, 'like');
-        this.incrementProfileEngagement(accountId, target.username);
+        this.updateLeadEngagementHistory(accountId, target.username);
         
         await this.dbManager.updateTarget(targetId, { isLiked: true, engagedAt: new Date() });
         
@@ -418,7 +640,7 @@ export class EngagementEngine {
       // Step 2: View and comment on stories (if enabled)
       if (settings.targetStories) {
         await this.engageWithStories(target, accountId, settings);
-        this.incrementProfileEngagement(accountId, target.username);
+        this.updateLeadEngagementHistory(accountId, target.username);
         
         // Delay before next action
         const delay = this.getRandomDelay(30, 60) * 1000;
@@ -441,7 +663,7 @@ export class EngagementEngine {
 
           this.incrementActionCount(accountId, 'follow');
           this.updateDailyStats(accountId, 'follow', true);
-          this.incrementProfileEngagement(accountId, target.username);
+          this.updateLeadEngagementHistory(accountId, target.username);
           
           await this.dbManager.logAction({
             accountId,
@@ -469,7 +691,7 @@ export class EngagementEngine {
       if (settings.maxCommentsPerHour > 0 && settings.commentMessages.length > 0 && this.canPerformAction(accountId, 'comment', settings)) {
         await this.commentOnRecentPosts(target, accountId, settings);
         this.incrementActionCount(accountId, 'comment');
-        this.incrementProfileEngagement(accountId, target.username);
+        this.updateLeadEngagementHistory(accountId, target.username);
         
         await this.dbManager.updateTarget(targetId, { isCommented: true });
         
