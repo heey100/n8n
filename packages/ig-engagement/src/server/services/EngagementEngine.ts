@@ -11,6 +11,15 @@ interface EngagementSettings {
   maxFollowsPerHour: number;
   maxLikesPerHour: number;
   maxCommentsPerHour: number;
+  
+  // Daily engagement limits
+  maxEngagementsPerDay: number; // Total daily engagement limit
+  maxFollowsPerDay: number;
+  maxLikesPerDay: number;
+  maxCommentsPerDay: number;
+  maxStoryViewsPerDay: number;
+  maxStoryCommentsPerDay: number;
+  
   targetStories: boolean;
   addToCloseFriends: boolean;
   commentMessages: string[];
@@ -20,6 +29,10 @@ interface EngagementSettings {
   skipVerifiedAccounts: boolean;
   minFollowers: number;
   maxFollowers: number;
+  
+  // Engagement frequency per profile
+  engagementsPerProfile: number; // How many times to engage with each profile
+  profileEngagementSpread: number; // Hours to spread engagements across
 }
 
 interface CampaignStats {
@@ -35,6 +48,21 @@ interface CampaignStats {
   lastRun: Date;
 }
 
+interface DailyEngagementStats {
+  date: string;
+  totalEngagements: number;
+  follows: number;
+  unfollows: number;
+  likes: number;
+  comments: number;
+  storyViews: number;
+  storyComments: number;
+  closeFriendsAdded: number;
+  profilesEngaged: number;
+  errors: number;
+  targetReached: boolean;
+}
+
 export class EngagementEngine {
   private instagramBot: InstagramBot;
   private dbManager: DatabaseManager;
@@ -42,20 +70,123 @@ export class EngagementEngine {
   private activeCampaigns: Map<string, NodeJS.Timeout> = new Map();
   private actionQueues: Map<string, any[]> = new Map();
   private rateLimits: Map<string, { follows: number; likes: number; comments: number; lastReset: Date }> = new Map();
+  private dailyStats: Map<string, DailyEngagementStats> = new Map(); // accountId -> daily stats
+  private profileEngagementTracking: Map<string, Map<string, number>> = new Map(); // accountId -> Map<username, engagementCount>
 
   constructor(instagramBot: InstagramBot, dbManager: DatabaseManager, io: Server) {
     this.instagramBot = instagramBot;
     this.dbManager = dbManager;
     this.io = io;
     
-    // Initialize rate limiting
+    // Initialize rate limiting and daily stats
     this.resetRateLimits();
+    this.initializeDailyStats();
     setInterval(() => this.resetRateLimits(), 60 * 60 * 1000); // Reset every hour
+    setInterval(() => this.resetDailyStats(), 24 * 60 * 60 * 1000); // Reset daily at midnight
   }
 
   private resetRateLimits(): void {
     this.rateLimits.clear();
     console.log('🔄 Rate limits reset');
+  }
+
+  private initializeDailyStats(): void {
+    // Initialize daily stats for all accounts
+    this.dailyStats.clear();
+    this.profileEngagementTracking.clear();
+    console.log('📊 Daily stats initialized');
+  }
+
+  private resetDailyStats(): void {
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Emit final daily stats before reset
+    for (const [accountId, stats] of this.dailyStats.entries()) {
+      this.io.emit('daily-engagement-completed', {
+        accountId,
+        stats: { ...stats, date: today }
+      });
+      
+      console.log(`📈 Account ${accountId} completed ${stats.totalEngagements} engagements today`);
+    }
+    
+    this.initializeDailyStats();
+    console.log('🆕 Daily stats reset for new day');
+  }
+
+  private getDailyStats(accountId: string): DailyEngagementStats {
+    if (!this.dailyStats.has(accountId)) {
+      const today = new Date().toISOString().split('T')[0];
+      this.dailyStats.set(accountId, {
+        date: today,
+        totalEngagements: 0,
+        follows: 0,
+        unfollows: 0,
+        likes: 0,
+        comments: 0,
+        storyViews: 0,
+        storyComments: 0,
+        closeFriendsAdded: 0,
+        profilesEngaged: 0,
+        errors: 0,
+        targetReached: false
+      });
+    }
+    return this.dailyStats.get(accountId)!;
+  }
+
+  private getProfileEngagementCount(accountId: string, username: string): number {
+    if (!this.profileEngagementTracking.has(accountId)) {
+      this.profileEngagementTracking.set(accountId, new Map());
+    }
+    const accountTracking = this.profileEngagementTracking.get(accountId)!;
+    return accountTracking.get(username) || 0;
+  }
+
+  private incrementProfileEngagement(accountId: string, username: string): void {
+    if (!this.profileEngagementTracking.has(accountId)) {
+      this.profileEngagementTracking.set(accountId, new Map());
+    }
+    const accountTracking = this.profileEngagementTracking.get(accountId)!;
+    const currentCount = accountTracking.get(username) || 0;
+    accountTracking.set(username, currentCount + 1);
+  }
+
+  private updateDailyStats(accountId: string, action: string, success: boolean = true): void {
+    const stats = this.getDailyStats(accountId);
+    
+    if (success) {
+      stats.totalEngagements++;
+      
+      switch (action) {
+        case 'follow':
+          stats.follows++;
+          break;
+        case 'unfollow':
+          stats.unfollows++;
+          break;
+        case 'like':
+          stats.likes++;
+          break;
+        case 'comment':
+          stats.comments++;
+          break;
+        case 'story_view':
+          stats.storyViews++;
+          break;
+        case 'story_comment':
+          stats.storyComments++;
+          break;
+        case 'close_friend_add':
+          stats.closeFriendsAdded++;
+          break;
+      }
+    } else {
+      stats.errors++;
+    }
+    
+    // Emit real-time stats update
+    this.io.emit('engagement-stats-update', { accountId, stats });
   }
 
   private getRateLimit(accountId: string): { follows: number; likes: number; comments: number; lastReset: Date } {
@@ -70,16 +201,31 @@ export class EngagementEngine {
     return this.rateLimits.get(accountId)!;
   }
 
-  private canPerformAction(accountId: string, action: 'follow' | 'like' | 'comment', settings: EngagementSettings): boolean {
+  private canPerformAction(accountId: string, action: 'follow' | 'like' | 'comment' | 'story_view' | 'story_comment', settings: EngagementSettings): boolean {
     const limits = this.getRateLimit(accountId);
+    const dailyStats = this.getDailyStats(accountId);
     
+    // Check if daily limit reached
+    if (dailyStats.totalEngagements >= settings.maxEngagementsPerDay) {
+      dailyStats.targetReached = true;
+      return false;
+    }
+    
+    // Check specific daily limits
     switch (action) {
       case 'follow':
-        return limits.follows < settings.maxFollowsPerHour;
+        return limits.follows < settings.maxFollowsPerHour && 
+               dailyStats.follows < settings.maxFollowsPerDay;
       case 'like':
-        return limits.likes < settings.maxLikesPerHour;
+        return limits.likes < settings.maxLikesPerHour && 
+               dailyStats.likes < settings.maxLikesPerDay;
       case 'comment':
-        return limits.comments < settings.maxCommentsPerHour;
+        return limits.comments < settings.maxCommentsPerHour && 
+               dailyStats.comments < settings.maxCommentsPerDay;
+      case 'story_view':
+        return dailyStats.storyViews < settings.maxStoryViewsPerDay;
+      case 'story_comment':
+        return dailyStats.storyComments < settings.maxStoryCommentsPerDay;
       default:
         return false;
     }
@@ -197,7 +343,7 @@ export class EngagementEngine {
   private async processTarget(target: any, accountId: string, settings: EngagementSettings): Promise<void> {
     try {
       // Check if target meets criteria
-      if (!await this.isValidTarget(target, settings)) {
+      if (!await this.isValidTarget(target, settings, accountId)) {
         return;
       }
 
@@ -229,7 +375,7 @@ export class EngagementEngine {
     }
   }
 
-  private async isValidTarget(target: any, settings: EngagementSettings): Promise<boolean> {
+  private async isValidTarget(target: any, settings: EngagementSettings, accountId: string): Promise<boolean> {
     // Check follower count
     if (target.followerCount < settings.minFollowers || target.followerCount > settings.maxFollowers) {
       return false;
@@ -245,6 +391,12 @@ export class EngagementEngine {
       return false;
     }
 
+    // Check if we've already engaged with this profile enough times
+    const currentEngagements = this.getProfileEngagementCount(accountId, target.username);
+    if (currentEngagements >= settings.engagementsPerProfile) {
+      return false;
+    }
+
     return true;
   }
 
@@ -254,6 +406,7 @@ export class EngagementEngine {
       if (settings.maxLikesPerHour > 0 && this.canPerformAction(accountId, 'like', settings)) {
         await this.likeRecentPosts(target, accountId, settings);
         this.incrementActionCount(accountId, 'like');
+        this.incrementProfileEngagement(accountId, target.username);
         
         await this.dbManager.updateTarget(targetId, { isLiked: true, engagedAt: new Date() });
         
@@ -265,6 +418,7 @@ export class EngagementEngine {
       // Step 2: View and comment on stories (if enabled)
       if (settings.targetStories) {
         await this.engageWithStories(target, accountId, settings);
+        this.incrementProfileEngagement(accountId, target.username);
         
         // Delay before next action
         const delay = this.getRandomDelay(30, 60) * 1000;
@@ -286,6 +440,8 @@ export class EngagementEngine {
           });
 
           this.incrementActionCount(accountId, 'follow');
+          this.updateDailyStats(accountId, 'follow', true);
+          this.incrementProfileEngagement(accountId, target.username);
           
           await this.dbManager.logAction({
             accountId,
@@ -313,6 +469,7 @@ export class EngagementEngine {
       if (settings.maxCommentsPerHour > 0 && settings.commentMessages.length > 0 && this.canPerformAction(accountId, 'comment', settings)) {
         await this.commentOnRecentPosts(target, accountId, settings);
         this.incrementActionCount(accountId, 'comment');
+        this.incrementProfileEngagement(accountId, target.username);
         
         await this.dbManager.updateTarget(targetId, { isCommented: true });
         
@@ -342,6 +499,8 @@ export class EngagementEngine {
           timestamp: new Date()
         });
 
+        this.updateDailyStats(accountId, 'like', success);
+
         if (success) {
           console.log(`❤️ Liked post by ${target.username}`);
         }
@@ -370,6 +529,8 @@ export class EngagementEngine {
           timestamp: new Date()
         });
 
+        this.updateDailyStats(accountId, 'comment', success);
+
         if (success) {
           console.log(`💬 Commented on ${target.username}'s post: "${comment}"`);
         }
@@ -384,6 +545,11 @@ export class EngagementEngine {
       const stories = await this.instagramBot.getUserStories(target.username);
       
       for (const story of stories.slice(0, 3)) { // Engage with up to 3 stories
+        // Check if we can still view stories
+        if (!this.canPerformAction(accountId, 'story_view', settings)) {
+          break;
+        }
+
         // View the story
         const viewSuccess = await this.instagramBot.viewStory(accountId, story.id);
         
@@ -395,12 +561,16 @@ export class EngagementEngine {
           timestamp: new Date()
         });
 
+        this.updateDailyStats(accountId, 'story_view', viewSuccess);
+
         if (viewSuccess) {
           console.log(`👀 Viewed ${target.username}'s story`);
         }
 
         // Comment on story (if enabled and has story comments)
-        if (settings.storyComments && settings.storyComments.length > 0 && Math.random() < 0.3) { // 30% chance
+        if (settings.storyComments && settings.storyComments.length > 0 && 
+            Math.random() < 0.3 && // 30% chance
+            this.canPerformAction(accountId, 'story_comment', settings)) {
           const comment = this.getRandomComment(settings.storyComments);
           const commentSuccess = await this.instagramBot.commentOnStory(accountId, story.id, comment);
           
@@ -411,6 +581,8 @@ export class EngagementEngine {
             success: commentSuccess,
             timestamp: new Date()
           });
+
+          this.updateDailyStats(accountId, 'story_comment', commentSuccess);
 
           if (commentSuccess) {
             console.log(`💬 Commented on ${target.username}'s story: "${comment}"`);
@@ -467,6 +639,8 @@ export class EngagementEngine {
               timestamp: new Date()
             });
 
+            this.updateDailyStats(target.accountId, 'unfollow', true);
+
             console.log(`👋 Unfollowed ${target.username}`);
           }
           
@@ -476,14 +650,16 @@ export class EngagementEngine {
         } catch (error) {
           console.error(`Failed to unfollow ${target.username}:`, error);
           
-          await this.dbManager.logAction({
-            accountId: target.accountId,
-            targetUsername: target.username,
-            action: 'unfollow',
-            success: false,
-            errorMessage: (error as Error).message,
-            timestamp: new Date()
-          });
+                      await this.dbManager.logAction({
+              accountId: target.accountId,
+              targetUsername: target.username,
+              action: 'unfollow',
+              success: false,
+              errorMessage: (error as Error).message,
+              timestamp: new Date()
+            });
+
+            this.updateDailyStats(target.accountId, 'unfollow', false);
         }
       }
 
@@ -587,5 +763,60 @@ export class EngagementEngine {
   // Get active campaigns count
   getActiveCampaignsCount(): number {
     return this.activeCampaigns.size;
+  }
+
+  // Get current daily stats for an account
+  getCurrentDailyStats(accountId: string): DailyEngagementStats {
+    return this.getDailyStats(accountId);
+  }
+
+  // Get current daily stats for all accounts
+  getAllCurrentDailyStats(): Map<string, DailyEngagementStats> {
+    return new Map(this.dailyStats);
+  }
+
+  // Get profile engagement tracking for an account
+  getProfileEngagementTracking(accountId: string): Map<string, number> {
+    if (!this.profileEngagementTracking.has(accountId)) {
+      return new Map();
+    }
+    return new Map(this.profileEngagementTracking.get(accountId)!);
+  }
+
+  // Force reset daily stats (for testing or manual reset)
+  async forceResetDailyStats(): Promise<void> {
+    this.resetDailyStats();
+  }
+
+  // Get engagement summary across all accounts
+  getEngagementSummary(): {
+    totalAccounts: number;
+    totalEngagements: number;
+    accountsSummary: Array<{
+      accountId: string;
+      engagements: number;
+      targetReached: boolean;
+      progress: number; // percentage towards daily goal
+    }>;
+  } {
+    const accounts = Array.from(this.dailyStats.entries());
+    const totalEngagements = accounts.reduce((sum, [_, stats]) => sum + stats.totalEngagements, 0);
+    
+    const accountsSummary = accounts.map(([accountId, stats]) => {
+      // This assumes we have access to settings somehow - you might need to store this
+      const progress = stats.totalEngagements; // Would calculate percentage with max engagements
+      return {
+        accountId,
+        engagements: stats.totalEngagements,
+        targetReached: stats.targetReached,
+        progress
+      };
+    });
+
+    return {
+      totalAccounts: accounts.length,
+      totalEngagements,
+      accountsSummary
+    };
   }
 }
