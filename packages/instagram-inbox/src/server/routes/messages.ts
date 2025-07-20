@@ -163,7 +163,7 @@ router.get('/search', async (req: AuthRequest, res) => {
     }
 
     // This is a simple implementation - in production you might want to use full-text search
-    let accounts = [];
+    let accounts: any[] = [];
     if (accountId) {
       const account = await dbManager.getAccount(accountId as string);
       if (account) accounts = [account];
@@ -208,7 +208,7 @@ router.get('/stats', async (req: AuthRequest, res) => {
     const daysAgo = new Date();
     daysAgo.setDate(daysAgo.getDate() - parseInt(days as string));
 
-    let accounts = [];
+    let accounts: any[] = [];
     if (accountId) {
       const account = await dbManager.getAccount(accountId as string);
       if (account) accounts = [account];
@@ -222,7 +222,7 @@ router.get('/stats', async (req: AuthRequest, res) => {
       outgoingMessages: 0,
       unreadMessages: 0,
       messagesInPeriod: 0,
-      accountStats: []
+      accountStats: [] as any[]
     };
 
     for (const account of accounts) {

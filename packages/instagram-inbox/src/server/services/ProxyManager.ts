@@ -90,7 +90,7 @@ export class ProxyManager {
       console.log(`✅ Proxy test successful. IP: ${response.data.origin}`);
       return true;
     } catch (error) {
-      console.error(`❌ Proxy test failed:`, error.message);
+      console.error(`❌ Proxy test failed:`, (error as Error).message);
       return false;
     }
   }
@@ -111,7 +111,7 @@ export class ProxyManager {
 
       return response.data.origin;
     } catch (error) {
-      console.error(`Failed to get proxy IP for ${proxyId}:`, error.message);
+      console.error(`Failed to get proxy IP for ${proxyId}:`, (error as Error).message);
       return null;
     }
   }

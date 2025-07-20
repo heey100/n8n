@@ -40,7 +40,7 @@ export interface Proxy {
 }
 
 export class DatabaseManager {
-  private db: sqlite3.Database;
+  private db!: sqlite3.Database;
   private dbPath: string;
 
   constructor() {
@@ -218,7 +218,7 @@ export class DatabaseManager {
     }
     
     query += ' ORDER BY timestamp DESC LIMIT ?';
-    params.push(limit);
+    params.push(limit.toString());
     
     const rows = await this.allQuery(query, params);
     return rows.map(this.mapMessage);
